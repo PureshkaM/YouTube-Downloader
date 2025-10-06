@@ -75,4 +75,4 @@ def serve_temp(filename):
 
 
 if __name__ == "__main__":
-    app.run(host="192.168.0.101", port=8443, ssl_context=("cert.pem", "key.pem"))
+    app.run(host="192.168.0.101", port=8080)
