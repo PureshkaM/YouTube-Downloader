@@ -7,208 +7,194 @@ import time
 import logging
 from logging.handlers import RotatingFileHandler
 
-# --- Конфигурация ---
-app = Flask(__name__)
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+def create_app():
+    app = Flask(__name__)
+    DOWNLOAD_DIR = "downloads"
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-TTL = 1800  # время жизни файла (30 минут)
-active_downloads = {}
+    TTL = 1800
+    active_downloads = {}
 
-# --- Настройка логирования с ограничением размера ---
-LOG_FILE = "server.log"
-log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    LOG_FILE = "server.log"
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-# максимум 5 МБ на файл, хранить до 3 архивных версий
-file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
-file_handler.setFormatter(log_formatter)
-file_handler.setLevel(logging.INFO)
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+    file_handler.setFormatter(log_formatter)
+    file_handler.setLevel(logging.INFO)
 
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_formatter)
 
-logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
-logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+    logger = logging.getLogger(__name__)
 
+    def cleanup_old_files():
+        while True:
+            now = time.time()
+            expired = [
+                fid for fid, data in list(active_downloads.items())
+                if now - data["timestamp"] > TTL
+            ]
+            for fid in expired:
+                try:
+                    os.remove(active_downloads[fid]["path"])
+                    logger.info(f"Удалён просроченный файл: {active_downloads[fid]['path']}")
+                except Exception as e:
+                    logger.warning(f"Ошибка при удалении {fid}: {e}")
+                active_downloads.pop(fid, None)
+            time.sleep(60)
 
-# --- Очистка старых файлов ---
-def cleanup_old_files():
-    while True:
-        now = time.time()
-        expired = [
-            fid for fid, data in list(active_downloads.items())
-            if now - data["timestamp"] > TTL
-        ]
+    threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-        for fid in expired:
-            try:
-                os.remove(active_downloads[fid]["path"])
-                logger.info(f"Удалён просроченный файл: {active_downloads[fid]['path']}")
-            except Exception as e:
-                logger.warning(f"Ошибка при удалении {fid}: {e}")
-            active_downloads.pop(fid, None)
-
-        time.sleep(60)
-
-
-threading.Thread(target=cleanup_old_files, daemon=True).start()
-
-
-# --- Нормализация ссылки YouTube ---
-def normalize_youtube_url(url: str) -> str:
-    try:
-        if "youtu.be/" in url:
-            video_id = url.split("youtu.be/")[-1].split("?")[0]
-        elif "youtube.com/watch" in url and "v=" in url:
-            video_id = url.split("v=")[-1].split("&")[0]
-        else:
+    def normalize_youtube_url(url: str) -> str:
+        try:
+            if "youtu.be/" in url:
+                video_id = url.split("youtu.be/")[-1].split("?")[0]
+            elif "youtube.com/watch" in url and "v=" in url:
+                video_id = url.split("v=")[-1].split("&")[0]
+            else:
+                return url
+            return f"https://www.youtube.com/watch?v={video_id}"
+        except Exception:
             return url
-        return f"https://www.youtube.com/watch?v={video_id}"
-    except Exception:
-        return url
 
+    @app.route("/api/formats", methods=["POST"])
+    def get_formats():
+        data = request.get_json()
+        url = data.get("url")
+        if not url:
+            return jsonify({"error": "No URL provided"}), 400
 
-# --- Получение списка доступных форматов ---
-@app.route("/api/formats", methods=["POST"])
-def get_formats():
-    data = request.get_json()
-    url = data.get("url")
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+        try:
+            if "youtube.com" in url or "youtu.be" in url:
+                if "v=" in url:
+                    url = url.split("v=")[-1].split("&")[0]
+                elif "youtu.be/" in url:
+                    url = url.split("youtu.be/")[-1].split("?")[0]
+                url = f"https://www.youtube.com/watch?v={url}"
+        except Exception as e:
+            logging.warning(f"Не удалось корректно обработать ссылку: {url} ({e})")
 
-    try:
-        if "youtube.com" in url or "youtu.be" in url:
-            if "v=" in url:
-                url = url.split("v=")[-1].split("&")[0]
-            elif "youtu.be/" in url:
-                url = url.split("youtu.be/")[-1].split("?")[0]
-            url = f"https://www.youtube.com/watch?v={url}"
-    except Exception as e:
-        logging.warning(f"Не удалось корректно обработать ссылку: {url} ({e})")
-
-    try:
-        ydl_opts = {"quiet": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        formats = []
-        seen = set()
-
-        for f in info.get("formats", []):
-            height = f.get("height")
-            fmt_note = f.get("format_note")
-            if f.get("vcodec") != "none" and height and fmt_note:
-                if fmt_note == "(default)":
-                    continue
-                quality = f"{height}p ({fmt_note})"
-                if quality not in seen:
-                    formats.append(quality)
-                    seen.add(quality)
-
-        logging.info(f"Запрошен список форматов для {url}: {formats}")
-        return jsonify(formats)
-
-    except Exception as e:
-        logging.error(f"Ошибка при получении форматов: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# --- Загрузка видео ---
-@app.route("/api/download", methods=["POST"])
-def download_video():
-    data = request.get_json() or {}
-    url = normalize_youtube_url(data.get("url", ""))
-    format_choice = (data.get("format_id") or data.get("quality", "")).strip()
-
-    if not url or not format_choice:
-        return jsonify({"error": "Missing parameters"}), 400
-
-    try:
-        format_choice = format_choice.split()[0] if " " in format_choice else format_choice
-
-        if "p" in format_choice:
-            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        try:
+            ydl_opts = {"quiet": True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            found_format = next(
-                (f["format_id"] for f in info["formats"]
-                 if f.get("height") and f"{f['height']}p" == format_choice and f.get("vcodec") != "none"),
-                None
-            )
+            formats = []
+            seen = set()
 
-            if not found_format:
-                found_format = f"bestvideo[height<={format_choice.replace('p','')}]+bestaudio/best"
-                logger.warning(f"Точный формат не найден, выбран автоформат: {found_format}")
+            for f in info.get("formats", []):
+                height = f.get("height")
+                fmt_note = f.get("format_note")
+                if f.get("vcodec") != "none" and height and fmt_note:
+                    if fmt_note == "(default)":
+                        continue
+                    label = f"{height}p"
+                    if label not in seen:
+                        formats.append(label)
+                        seen.add(label)
 
-            format_choice = found_format
+            logger.info(f"Запрошен список форматов для {url}: {formats}")
+            return jsonify(formats)
 
-        # --- Генерация временного имени файла ---
-        file_id = str(uuid.uuid4())
-        output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
+        except Exception as e:
+            logger.error(f"Ошибка при получении форматов: {e}")
+            return jsonify({"error": str(e)}), 500
 
-        ydl_opts = {
-            "quiet": True,
-            "format": format_choice,
-            "merge_output_format": "mp4",
-            "outtmpl": output_path,
-        }
+    @app.route("/api/download", methods=["POST"])
+    def download_video():
+        data = request.get_json() or {}
+        url = normalize_youtube_url(data.get("url", ""))
+        format_choice = (data.get("format_id") or data.get("quality", "")).strip()
 
-        logger.info(f"Начало загрузки: {url} (качество {format_choice})")
+        if not url or not format_choice:
+            return jsonify({"error": "Missing parameters"}), 400
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            final_ext = info_dict.get("ext", "mp4")
+        try:
+            format_choice = format_choice.split()[0] if " " in format_choice else format_choice
 
-        final_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.{final_ext}")
-        active_downloads[file_id] = {"path": final_path, "timestamp": time.time()}
+            if "p" in format_choice:
+                with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
 
-        download_url = f"http://{request.host}/api/file/{file_id}"
-        logger.info(f"Видео скачано: {final_path}")
-        return jsonify({"download_url": download_url, "file_id": file_id})
+                found_format = next(
+                    (f["format_id"] for f in info["formats"]
+                     if f.get("height") and f"{f['height']}p" == format_choice and f.get("vcodec") != "none"),
+                    None
+                )
 
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке видео: {e}")
-        return jsonify({"error": str(e)}), 500
+                if not found_format:
+                    found_format = f"bestvideo[height<={format_choice.replace('p','')}]+bestaudio/best"
+                    logger.warning(f"Точный формат не найден, выбран автоформат: {found_format}")
+
+                format_choice = found_format
+
+            file_id = str(uuid.uuid4())
+            output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
+
+            ydl_opts = {
+                "quiet": True,
+                "format": format_choice,
+                "merge_output_format": "mp4",
+                "outtmpl": output_path,
+            }
+
+            logger.info(f"Начало загрузки: {url} (качество {format_choice})")
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(url, download=True)
+                final_ext = info_dict.get("ext", "mp4")
+
+            final_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.{final_ext}")
+            active_downloads[file_id] = {"path": final_path, "timestamp": time.time()}
+
+            download_url = f"http://{request.host}/api/file/{file_id}"
+            logger.info(f"Видео скачано: {final_path}")
+            return jsonify({"download_url": download_url, "file_id": file_id})
+
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке видео: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/file/<file_id>")
+    def serve_file(file_id):
+        entry = active_downloads.get(file_id)
+        if not entry or not os.path.exists(entry["path"]):
+            logger.warning(f"Файл не найден: {file_id}")
+            return jsonify({"error": "File not found"}), 404
+
+        logger.info(f"Файл отдан клиенту: {file_id}")
+        return send_file(entry["path"], as_attachment=True)
+
+    @app.route("/api/status", methods=["POST"])
+    def api_status():
+        data = request.get_json() or {}
+        url = data.get("url")
+        if not url:
+            return jsonify({"error": "Missing URL parameter"}), 400
+
+        try:
+            file_id = url.strip().split("/")[-1]
+        except Exception:
+            return jsonify({"error": "Invalid URL format"}), 400
+
+        entry = active_downloads.get(file_id)
+        if not entry:
+            return jsonify({"error": "File not found or already deleted"}), 404
+
+        try:
+            os.remove(entry["path"])
+            del active_downloads[file_id]
+            logger.info(f"Файл {file_id} удалён по POST-запросу")
+            return jsonify({"message": "Файл удалён"}), 200
+        except Exception as e:
+            logger.warning(f"Ошибка при удалении {file_id}: {e}")
+            return jsonify({"error": f"Ошибка при удалении: {e}"}), 500
+
+    return app
 
 
-# --- Отдача файла ---
-@app.route("/api/file/<file_id>")
-def serve_file(file_id):
-    entry = active_downloads.get(file_id)
-    if not entry or not os.path.exists(entry["path"]):
-        logger.warning(f"Файл не найден: {file_id}")
-        return jsonify({"error": "File not found"}), 404
-
-    logger.info(f"Файл отдан клиенту: {file_id}")
-    return send_file(entry["path"], as_attachment=True)
-
-
-# --- Удаление файла по запросу ---
-@app.route("/api/status", methods=["POST"])
-def api_status():
-    data = request.get_json() or {}
-    url = data.get("url")
-    if not url:
-        return jsonify({"error": "Missing URL parameter"}), 400
-
-    try:
-        file_id = url.strip().split("/")[-1]
-    except Exception:
-        return jsonify({"error": "Invalid URL format"}), 400
-
-    entry = active_downloads.get(file_id)
-    if not entry:
-        return jsonify({"error": "File not found or already deleted"}), 404
-
-    try:
-        os.remove(entry["path"])
-        del active_downloads[file_id]
-        logger.info(f"Файл {file_id} удалён по POST-запросу")
-        return jsonify({"message": "Файл удалён"}), 200
-    except Exception as e:
-        logger.warning(f"Ошибка при удалении {file_id}: {e}")
-        return jsonify({"error": f"Ошибка при удалении: {e}"}), 500
-
-
+# --- Для локального теста ---
 if __name__ == "__main__":
-    app.run(host="172.20.10.2", port=3306)
+    app = create_app()
+    app.run(host="0.0.0.0", port=5000)
