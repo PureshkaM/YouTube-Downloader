@@ -60,42 +60,30 @@ def create_app():
 
     @app.route("/api/formats", methods=["POST"])
     def get_formats():
-        data = request.get_json()
-        url = data.get("url")
+        data = request.get_json() or {}
+        url = normalize_youtube_url(data.get("url", ""))
+
         if not url:
             return jsonify({"error": "No URL provided"}), 400
 
         try:
-            if "youtube.com" in url or "youtu.be" in url:
-                if "v=" in url:
-                    url = url.split("v=")[-1].split("&")[0]
-                elif "youtu.be/" in url:
-                    url = url.split("youtu.be/")[-1].split("?")[0]
-                url = f"https://www.youtube.com/watch?v={url}"
-        except Exception as e:
-            logging.warning(f"Не удалось корректно обработать ссылку: {url} ({e})")
-
-        try:
-            ydl_opts = {"quiet": True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
                 info = ydl.extract_info(url, download=False)
 
             formats = []
             seen = set()
 
             for f in info.get("formats", []):
-                height = f.get("height")
-                fmt_note = f.get("format_note")
-                if f.get("vcodec") != "none" and height and fmt_note:
-                    if fmt_note == "(default)":
+                if f.get("vcodec") != "none" and f.get("height") and f.get("format_note"):
+                    if f['format_note'] == "(default)":
                         continue
-                    label = f"{height}p"
+                    label = f"{f['height']}p ({f['format_note']})"
                     if label not in seen:
                         formats.append(label)
                         seen.add(label)
 
-            logger.info(f"Запрошен список форматов для {url}: {formats}")
-            return jsonify(formats)
+            logger.info(f"Форматы для {url}: {formats}")
+            return jsonify(formats or ["Не удалось определить форматы"])
 
         except Exception as e:
             logger.error(f"Ошибка при получении форматов: {e}")
@@ -197,4 +185,4 @@ def create_app():
 # --- Для локального теста ---
 if __name__ == "__main__":
     app = create_app()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="127.0.0.1", port=5000)
