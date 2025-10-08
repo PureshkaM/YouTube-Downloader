@@ -177,7 +177,8 @@ def serve_file(file_id):
 
 @app.route("/api/status", methods=["POST"])
 def api_status():
-    url = request.args.get("url")
+    args = request.get_json()
+    url = args.get("url")
     status = "POST"
     if not url:
         return jsonify({"error": "Missing URL parameter"}), 400
@@ -206,4 +207,4 @@ def api_status():
 
 
 if __name__ == "__main__":
-    app.run(host="172.20.10.2", port=8080)
+    app.run(host="172.20.10.2", port=3306)
