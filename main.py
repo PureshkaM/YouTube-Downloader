@@ -1,188 +1,265 @@
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
+import time
 import threading
 import os
 import uuid
-import time
+from pathlib import Path
+from waitress import serve
 import logging
 from logging.handlers import RotatingFileHandler
 
-def create_app():
-    app = Flask(__name__)
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# --- Конфигурация ---
+app = Flask(__name__)
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    TTL = 1800
-    active_downloads = {}
+active_downloads = []  # [{session_id, url, filename, created_at, formats_map, best_audio}]
 
-    LOG_FILE = "server.log"
-    log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+# --- Логирование в файл и консоль ---
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler = RotatingFileHandler("server.log", maxBytes=1_000_000, backupCount=3)
+file_handler.setFormatter(log_formatter)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+logger = logging.getLogger(__name__)
 
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
-    file_handler.setFormatter(log_formatter)
-    file_handler.setLevel(logging.INFO)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_formatter)
-
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
-    logger = logging.getLogger(__name__)
-
-    def cleanup_old_files():
-        while True:
-            now = time.time()
-            expired = [
-                fid for fid, data in list(active_downloads.items())
-                if now - data["timestamp"] > TTL
-            ]
-            for fid in expired:
+# --- Вспомогательные функции ---
+def cleanup_expired_sessions():
+    """Удаляет старые записи (>30 мин)."""
+    while True:
+        now = time.time()
+        for record in active_downloads[:]:
+            if now - record["created_at"] > 1800:  # 30 минут
+                if record.get("filename"):
+                    path = os.path.join(DOWNLOAD_DIR, record["filename"])
+                    if os.path.exists(path):
+                        os.remove(path)
+                        logger.info(f"[AUTO] Удалён файл {record['filename']} (сессия {record['session_id']})")
                 try:
-                    os.remove(active_downloads[fid]["path"])
-                    logger.info(f"Удалён просроченный файл: {active_downloads[fid]['path']}")
-                except Exception as e:
-                    logger.warning(f"Ошибка при удалении {fid}: {e}")
-                active_downloads.pop(fid, None)
-            time.sleep(60)
+                    active_downloads.remove(record)
+                except ValueError:
+                    pass
+                logger.info(f"[AUTO] Очистка сессии {record['session_id']}")
+        time.sleep(300)
 
-    threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-    def normalize_youtube_url(url: str) -> str:
-        try:
-            if "youtu.be/" in url:
-                video_id = url.split("youtu.be/")[-1].split("?")[0]
-            elif "youtube.com/watch" in url and "v=" in url:
-                video_id = url.split("v=")[-1].split("&")[0]
-            else:
-                return url
-            return f"https://www.youtube.com/watch?v={video_id}"
-        except Exception:
-            return url
+def find_download(session_id):
+    for entry in active_downloads:
+        if entry["session_id"] == session_id:
+            return entry
+    return None
 
-    @app.route("/api/formats", methods=["POST"])
-    def get_formats():
-        data = request.get_json() or {}
-        url = normalize_youtube_url(data.get("url", ""))
 
-        if not url:
-            return jsonify({"error": "No URL provided"}), 400
+def build_formats_map(info):
+    formats_map = {}
+    best_audio = None
+    best_audio_abr = 0
 
-        try:
-            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
+    # ищем лучший аудио поток
+    for f in info.get("formats", []):
+        if f.get("acodec") and f.get("vcodec") in (None, "none"):
+            abr = f.get("abr") or f.get("tbr") or 0
+            if abr > best_audio_abr:
+                best_audio_abr = abr
+                best_audio = f.get("format_id")
 
-            formats = []
-            seen = set()
+    for f in info.get("formats", []):
+        if f.get("vcodec") == "none":
+            continue
 
-            for f in info.get("formats", []):
-                if f.get("vcodec") != "none" and f.get("height") and f.get("format_note"):
-                    if f['format_note'] == "(default)":
-                        continue
-                    label = f"{f['height']}p ({f['format_note']})"
-                    if label not in seen:
-                        formats.append(label)
-                        seen.add(label)
+        width = f.get("width") or 0
+        height = f.get("height") or 0
+        if not width or not height:
+            continue
 
-            logger.info(f"Форматы для {url}: {formats}")
-            return jsonify(formats or ["Не удалось определить форматы"])
+        display_height = min(width, height)
 
-        except Exception as e:
-            logger.error(f"Ошибка при получении форматов: {e}")
-            return jsonify({"error": str(e)}), 500
+        # Ограничение: не выше 1080p
+        if display_height > 1080:
+            continue
 
-    @app.route("/api/download", methods=["POST"])
-    def download_video():
-        data = request.get_json() or {}
-        url = normalize_youtube_url(data.get("url", ""))
-        format_choice = (data.get("format_id") or data.get("quality", "")).strip()
+        fps = int(f.get("fps") or 0)
+        fps_suffix = f"{fps}" if fps >= 50 else ""
+        label = f"{display_height}p{fps_suffix}".strip()
 
-        if not url or not format_choice:
-            return jsonify({"error": "Missing parameters"}), 400
+        entry = formats_map.setdefault(label, {"combined": None, "video": None, "height": display_height, "v_tbr": 0})
+        if f.get("vcodec") != "none" and f.get("acodec") != "none":
+            entry["combined"] = f.get("format_id")
+        elif f.get("vcodec") != "none":
+            tbr = f.get("tbr") or 0
+            if tbr >= entry.get("v_tbr", 0):
+                entry["video"] = f.get("format_id")
+                entry["v_tbr"] = tbr
 
-        try:
-            format_choice = format_choice.split()[0] if " " in format_choice else format_choice
+    labels = sorted(formats_map.keys(), key=lambda x: int(''.join(filter(str.isdigit, x)) or 0))
+    return labels, formats_map, best_audio
 
-            if "p" in format_choice:
-                with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
 
-                found_format = next(
-                    (f["format_id"] for f in info["formats"]
-                     if f.get("height") and f"{f['height']}p" == format_choice and f.get("vcodec") != "none"),
-                    None
-                )
-
-                if not found_format:
-                    found_format = f"bestvideo[height<={format_choice.replace('p','')}]+bestaudio/best"
-                    logger.warning(f"Точный формат не найден, выбран автоформат: {found_format}")
-
-                format_choice = found_format
-
-            file_id = str(uuid.uuid4())
-            output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
-
-            ydl_opts = {
-                "quiet": True,
-                "format": format_choice,
-                "merge_output_format": "mp4",
-                "outtmpl": output_path,
+def download_and_find_file(url, format_selector, file_id):
+    """
+    Запускает yt_dlp с format_selector и возвращает фактический путь к скачанному файлу.
+    Ищем файл по шаблону file_id.* в DOWNLOAD_DIR.
+    """
+    output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
+    ydl_opts = {
+        "format": format_selector,
+        "quiet": True,
+        "outtmpl": str(output_template),
+        "merge_output_format": "mp4",
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
             }
+        ],
+        "postprocessor_args": [
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-movflags", "+faststart"
+        ],
+        "concurrent_fragment_downloads": 3,
+        "retries": 10,
+        "fragment_retries": 10,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+        # найти созданный файл
+        candidates = list(Path(DOWNLOAD_DIR).glob(f"{file_id}.*"))
+        if not candidates:
+            logger.error("После загрузки файл не найден по шаблону %s.*", file_id)
+            return None
+        # если есть несколько — взять первый
+        return str(candidates[0])
+    except Exception as e:
+        logger.error("yt_dlp failed: %s", e)
+        return None
 
-            logger.info(f"Начало загрузки: {url} (качество {format_choice})")
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(url, download=True)
-                final_ext = info_dict.get("ext", "mp4")
+# --- API ---
+@app.route("/get_formats", methods=["POST"])
+def get_formats():
+    data = request.get_json() or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "URL не передан"}), 400
 
-            final_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.{final_ext}")
-            active_downloads[file_id] = {"path": final_path, "timestamp": time.time()}
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-            download_url = f"http://{request.host}/api/file/{file_id}"
-            logger.info(f"Видео скачано: {final_path}")
-            return jsonify({"download_url": download_url, "file_id": file_id})
+        labels, fmt_map, best_audio = build_formats_map(info)
 
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке видео: {e}")
-            return jsonify({"error": str(e)}), 500
+        if not labels:
+            return jsonify({"error": "Не удалось определить форматы"}), 500
 
-    @app.route("/api/file/<file_id>")
-    def serve_file(file_id):
-        entry = active_downloads.get(file_id)
-        if not entry or not os.path.exists(entry["path"]):
-            logger.warning(f"Файл не найден: {file_id}")
-            return jsonify({"error": "File not found"}), 404
+        session_id = str(uuid.uuid4())
+        active_downloads.append({
+            "session_id": session_id,
+            "url": url,
+            "filename": None,
+            "created_at": time.time(),
+            "formats_map": fmt_map,
+            "labels": labels,
+            "best_audio": best_audio
+        })
 
-        logger.info(f"Файл отдан клиенту: {file_id}")
-        return send_file(entry["path"], as_attachment=True)
+        logger.info("Создана сессия %s для %s — форматов: %s", session_id, url, labels)
+        return jsonify({"session_id": session_id, "available_formats": labels})
 
-    @app.route("/api/status", methods=["POST"])
-    def api_status():
-        data = request.get_json() or {}
-        url = data.get("url")
-        if not url:
-            return jsonify({"error": "Missing URL parameter"}), 400
+    except Exception as e:
+        logger.exception("Ошибка при получении форматов")
+        return jsonify({"error": str(e)}), 500
 
+
+@app.route("/download", methods=["POST"])
+def download():
+    data = request.get_json() or {}
+    session_id = data.get("session_id")
+    selected_label = data.get("quality")
+    if not session_id or not selected_label:
+        return jsonify({"error": "Параметры отсутствуют"}), 400
+
+    record = find_download(session_id)
+    if not record:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    fmt_map = record.get("formats_map") or {}
+    entry = fmt_map.get(selected_label)
+    if not entry:
+        # safety: try nearest available resolution
+        labels = record.get("labels", [])
+        if not labels:
+            return jsonify({"error": "Форматы для сессии не найдены"}), 500
+        # pick nearest by absolute difference
         try:
-            file_id = url.strip().split("/")[-1]
+            target_h = int(selected_label.replace("p", ""))
+            nearest = min(labels, key=lambda x: abs(int(x.replace("p", "")) - target_h))
+            logger.warning("Запрошенное качество %s отсутствует — выбрано ближайшее %s", selected_label, nearest)
+            entry = fmt_map.get(nearest)
         except Exception:
-            return jsonify({"error": "Invalid URL format"}), 400
+            return jsonify({"error": "Неправильный формат качества"}), 400
 
-        entry = active_downloads.get(file_id)
-        if not entry:
-            return jsonify({"error": "File not found or already deleted"}), 404
+    format_selector = None
+    if entry.get("combined"):
+        format_selector = entry["combined"]
+        logger.info("Используется комбинированный формат %s для %s", format_selector, selected_label)
+    else:
+        best_audio = record.get("best_audio")
+        if entry.get("video") and best_audio:
+            format_selector = f"{entry['video']}+{best_audio}"
+            logger.info("Собираем video_id+best_audio: %s", format_selector)
+        elif entry.get("video"):
+            # fallback: try height-based selector
+            h = entry.get("height")
+            format_selector = f"bestvideo[height<={h}]+bestaudio/best"
+            logger.info("Fallback: используем селектор %s", format_selector)
+        else:
+            logger.error("Не удалось подобрать формат для %s", selected_label)
+            return jsonify({"error": "Невозможно подобрать формат для скачивания"}), 500
 
-        try:
-            os.remove(entry["path"])
-            del active_downloads[file_id]
-            logger.info(f"Файл {file_id} удалён по POST-запросу")
-            return jsonify({"message": "Файл удалён"}), 200
-        except Exception as e:
-            logger.warning(f"Ошибка при удалении {file_id}: {e}")
-            return jsonify({"error": f"Ошибка при удалении: {e}"}), 500
+    # выполняем скачивание
+    file_id = str(uuid.uuid4())
+    filepath = download_and_find_file(record["url"], format_selector, file_id)
+    if not filepath:
+        return jsonify({"error": "Ошибка при скачивании"}), 500
 
-    return app
+    record["filename"] = os.path.basename(filepath)
+    logger.info("Видео скачано: %s (сессия %s)", record["filename"], session_id)
+    return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath))
 
 
-# --- Для локального теста ---
+@app.route("/cleanup", methods=["POST"])
+def cleanup():
+    data = request.get_json() or {}
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id обязателен"}), 400
+
+    record = find_download(session_id)
+    if not record:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    if record.get("filename"):
+        path = os.path.join(DOWNLOAD_DIR, record["filename"])
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info("Файл %s удалён (сессия %s)", record["filename"], session_id)
+        else:
+            logger.warning("Файл %s не найден при очистке (сессия %s)", record["filename"], session_id)
+
+    try:
+        active_downloads.remove(record)
+    except ValueError:
+        pass
+    return jsonify({"status": "deleted", "session_id": session_id})
+
+
+# --- Запуск ---
 if __name__ == "__main__":
-    app = create_app()
-    app.run(host="127.0.0.1", port=5000)
+    threading.Thread(target=cleanup_expired_sessions, daemon=True).start()
+    logger.info("Сервер запущен и ожидает запросы")
+    serve(app, host="192.168.0.101", port=3306)
